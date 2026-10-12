@@ -1,0 +1,642 @@
+---
+title: "Data Visualization and Insight Communication: What Drives Airbnb Prices in Amsterdam?"
+author: "Rahul Jadhav"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      dpi = 300, fig.width = 7, fig.height = 4.5)
+```
+
+# 1. Introduction
+
+**Purpose.** This report turns the Amsterdam Airbnb listings dataset into a series of visualizations that answer one practical question: **what makes a listing more or less expensive, and where are the patterns and surprises?**
+
+**Audience.** The report is written for a non-technical reader, such as a host, a traveller or a city analyst. Under every chart you will find the same five parts:
+
+1. **Question:** what the chart is trying to answer
+2. **Why this chart:** why this chart type suits the question
+3. **Code:** the R code that produces it
+4. **What it shows:** the pattern in plain language
+5. **So what:** why it matters
+
+**Tools.** R with `ggplot2` for most charts, `patchwork` for combining charts, and one example each of base R and `lattice` graphics.
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(patchwork)
+library(lattice)
+library(knitr)
+```
+
+# 2. Data Overview
+
+## 2.1 Source
+
+The data comes from **Inside Airbnb** (https://insideairbnb.com/get-the-data/), Amsterdam, detailed listings file. It continues the dataset used in Week 1, where the data was cleaned and explored. Each row is one listing.
+
+## 2.2 Key variables
+
+| Variable | Type | Meaning |
+|---|---|---|
+| price | Number | Nightly price in US dollars (the main outcome) |
+| room_type | Category | Entire home/apt, Private room, Hotel room or Shared room |
+| neighbourhood_cleansed | Category | Amsterdam neighbourhood |
+| accommodates | Number | How many guests the listing sleeps |
+| bedrooms, beds | Number | Size of the listing |
+| number_of_reviews, review_scores_rating | Number | How many reviews and the average score (0 to 5) |
+| host_is_superhost | Yes/No | Whether the host has Superhost status |
+| minimum_nights, availability_365 | Number | Booking rules and days available per year |
+| first_review | Date | Date of the first guest review |
+| latitude, longitude | Number | Location of the listing |
+
+## 2.3 Preparing the data
+
+The cleaning rules from Week 1 are repeated here in short form, so that this document runs on its own:
+
+- Listings **without a price** are removed (the price is the outcome, so it is not guessed).
+- Missing `bedrooms` and `beds` are filled with the median for listings of the same guest capacity.
+- Extreme prices are **capped at the 99th percentile** (`price_w`) for plotting, and a log version (`log_price`) is created for correlations.
+
+```{r load}
+# Find the data file (the download sometimes unpacks into a folder of the same name)
+candidates <- c("listings.csv/listings.csv", "listings.csv", "listings.csv.gz")
+found <- candidates[file.exists(candidates) & !dir.exists(candidates)]
+if (length(found) == 0) stop("Data file not found. Put listings.csv next to this .Rmd file.")
+data_file <- found[1]
+
+keep <- c("id", "price", "room_type", "property_type", "neighbourhood_cleansed",
+          "accommodates", "bedrooms", "beds", "minimum_nights", "availability_365",
+          "number_of_reviews", "reviews_per_month", "review_scores_rating",
+          "host_is_superhost", "host_listings_count", "latitude", "longitude",
+          "first_review", "last_review")
+
+raw <- read_csv(data_file, col_select = any_of(keep), show_col_types = FALSE)
+cat("Listings in the file:", nrow(raw), "\n")
+```
+
+```{r prepare}
+to_bin <- function(x) {
+  case_when(as.character(x) %in% c("t", "TRUE")  ~ 1L,
+            as.character(x) %in% c("f", "FALSE") ~ 0L,
+            TRUE ~ NA_integer_)
+}
+winsor <- function(x) {
+  q <- quantile(x, c(.01, .99), na.rm = TRUE)
+  pmin(pmax(x, q[1]), q[2])
+}
+
+df <- raw %>%
+  mutate(price             = parse_number(as.character(price)),
+         host_is_superhost = to_bin(host_is_superhost),
+         first_review      = as.Date(first_review),
+         last_review       = as.Date(last_review),
+         across(c(room_type, property_type, neighbourhood_cleansed), as.factor)) %>%
+  filter(!is.na(price), price > 0) %>%
+  mutate(reviews_per_month = ifelse(number_of_reviews == 0 & is.na(reviews_per_month),
+                                    0, reviews_per_month)) %>%
+  group_by(accommodates) %>%
+  mutate(across(c(bedrooms, beds), ~ replace_na(., median(., na.rm = TRUE)))) %>%
+  ungroup() %>%
+  mutate(across(c(bedrooms, beds, minimum_nights, review_scores_rating,
+                  reviews_per_month, host_listings_count),
+                ~ replace_na(., median(., na.rm = TRUE))),
+         host_is_superhost = replace_na(host_is_superhost, 0L),
+         price_w   = winsor(price),
+         log_price = log(price_w),
+         across(c(accommodates, bedrooms, beds, minimum_nights, number_of_reviews,
+                  review_scores_rating, host_listings_count),
+                winsor, .names = "{.col}_w"),
+         size_group = cut(accommodates, breaks = c(0, 2, 4, Inf),
+                          labels = c("1-2 guests", "3-4 guests", "5+ guests")))
+
+# The ten neighbourhoods with the most listings
+top10 <- df %>% count(neighbourhood_cleansed, sort = TRUE) %>%
+  slice_head(n = 10) %>% pull(neighbourhood_cleansed)
+
+cat("Listings with a price (used in this report):", nrow(df), "\n")
+```
+
+The prepared data has **`r comma(nrow(df))` listings** with a price (out of `r comma(nrow(raw))` in the file). The median price is **`r dollar(median(df$price))`** per night.
+
+# 3. Design Choices
+
+A good chart is easy to read for someone who has never seen the data. Every chart in this report follows the same rules:
+
+- **One message per chart**, stated in the title.
+- **A colour-blind-safe palette**, with the same colour for the same room type in every chart.
+- **Plain labels and dollar signs** on the axes, with no technical variable names.
+- **Direct labels** (numbers on the bars and medians on the boxes) so readers do not have to estimate values.
+- **A log scale** for prices where the data is very skewed. A log scale gives each doubling of price the same distance, so the cheap and expensive listings are both visible.
+
+```{r theme}
+pal_room <- c("Entire home/apt" = "#0072B2", "Private room" = "#E69F00",
+              "Hotel room"      = "#009E73", "Shared room"  = "#CC79A7")
+
+theme_airbnb <- function() {
+  theme_minimal(base_size = 11) +
+    theme(plot.title      = element_text(face = "bold", size = 13),
+          plot.subtitle   = element_text(colour = "grey30"),
+          plot.caption    = element_text(colour = "grey45", hjust = 0),
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom")
+}
+src <- "Source: Inside Airbnb, Amsterdam"
+```
+
+# 4. Visualizations
+
+## 4.1 How much does a night cost? (histogram)
+
+**Question.** What do Amsterdam listings usually cost, and how spread out are the prices?
+
+**Why this chart.** A histogram shows the whole shape of a number: where most listings sit, and how long the tail of expensive listings is. An average alone would hide that.
+
+```{r p1, fig.cap="Figure 1: Distribution of nightly prices"}
+p1 <- ggplot(df, aes(price_w)) +
+  geom_histogram(binwidth = 25, boundary = 0, fill = "#0072B2", colour = "white") +
+  geom_vline(xintercept = median(df$price), colour = "#D55E00",
+             linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = median(df$price) + 15, y = Inf,
+           label = paste("Median:", dollar(median(df$price))),
+           hjust = 0, vjust = 1.6, colour = "#D55E00", fontface = "bold") +
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = comma) +
+  labs(title = paste0("Half of all listings cost between ",
+                      dollar(quantile(df$price, .25)), " and ", dollar(quantile(df$price, .75)),
+                      " a night"),
+       subtitle = "A few very expensive listings stretch the right-hand tail",
+       x = "Price per night (prices above the 99th percentile are capped)",
+       y = "Number of listings", caption = src) +
+  theme_airbnb()
+p1
+```
+
+**What it shows.** The median listing costs **`r dollar(median(df$price))`** per night, while the average is higher at **`r dollar(mean(df$price))`**. The average is pulled up by a small number of very expensive listings, which is why the histogram has a long tail to the right. Nine in ten listings cost less than **`r dollar(quantile(df$price, 0.9))`**.
+
+**So what.** When you read "average price" in a report about short-term rentals, remember that it overstates what a typical guest pays. The median is the fairer number.
+
+## 4.2 What kinds of listings are there? (bar chart)
+
+**Question.** How is the market split between entire homes, private rooms and other types?
+
+**Why this chart.** Bar charts are the clearest way to compare counts across a few categories. The length of the bar can be compared at a glance.
+
+```{r p2, fig.cap="Figure 2: Number of listings by room type", fig.height=3.5}
+room_counts <- df %>%
+  count(room_type) %>%
+  mutate(pct = n / sum(n), room_type = fct_reorder(room_type, n))
+
+p2 <- ggplot(room_counts, aes(room_type, n, fill = room_type)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0(comma(n), " (", percent(pct, accuracy = 0.1), ")")),
+            hjust = -0.08, size = 3.6) +
+  scale_fill_manual(values = pal_room) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.3)), labels = comma) +
+  coord_flip() +
+  labs(title = "Entire homes make up most of the market",
+       subtitle = "Hotel rooms and shared rooms are very rare",
+       x = NULL, y = "Number of listings", caption = src) +
+  theme_airbnb()
+p2
+```
+
+**What it shows.** **`r percent(mean(df$room_type == "Entire home/apt"), accuracy = 1)`** of listings are entire homes or apartments and **`r percent(mean(df$room_type == "Private room"), accuracy = 1)`** are private rooms. Hotel rooms (`r sum(df$room_type == "Hotel room")` listings) and shared rooms (`r sum(df$room_type == "Shared room")` listings) are so rare that any result about them should be treated with care.
+
+**So what.** Because entire homes dominate, they largely decide the overall price picture, and comparisons between areas must take the room type into account (see sections 4.4 and 4.8).
+
+## 4.3 Does room type change the price? (boxplot)
+
+**Question.** How different are prices between the four room types, and how much do prices vary inside each type?
+
+**Why this chart.** A boxplot summarises a whole group in one shape: the middle line is the median, the box holds the middle half of listings, and the dots are unusual listings. It allows four groups to be compared side by side.
+
+```{r p3, fig.cap="Figure 3: Price by room type (log scale)"}
+df_rt <- df %>% mutate(room_type = fct_reorder(room_type, price_w, median))
+med_rt <- df_rt %>% group_by(room_type) %>% summarise(m = median(price_w), .groups = "drop")
+
+p3 <- ggplot(df_rt, aes(room_type, price_w, fill = room_type)) +
+  geom_boxplot(alpha = 0.85, outlier.alpha = 0.25, show.legend = FALSE) +
+  geom_label(data = med_rt, aes(y = m, label = dollar(m)),
+             fill = "white", size = 3.3, nudge_x = 0.38, label.size = 0) +
+  scale_y_log10(labels = dollar) +
+  scale_fill_manual(values = pal_room) +
+  labs(title = "Entire homes cost nearly twice as much as private rooms",
+       subtitle = "Median price per night; the price axis is logarithmic",
+       x = NULL, y = "Price per night (log scale)", caption = src) +
+  theme_airbnb()
+p3
+```
+
+```{r mp, include=FALSE}
+mp <- tapply(df$price, df$room_type, median)
+```
+
+**What it shows.** The median entire home costs **`r dollar(mp["Entire home/apt"])`** per night, compared with **`r dollar(mp["Private room"])`** for a private room and **`r dollar(mp["Shared room"])`** for a shared room. The boxes for entire homes and private rooms overlap only partly, so room type separates prices well. There is still a wide spread within each group, shown by the many dots above and below the boxes.
+
+**So what.** Room type is the clearest single price signal in the data. It is also the reason that other comparisons, such as neighbourhood or host status, can mislead if room type is ignored.
+
+## 4.4 Which neighbourhoods are the most expensive? (lollipop chart)
+
+**Question.** Among entire homes, which neighbourhoods charge the most?
+
+**Why this chart.** A lollipop chart is a cleaner version of a bar chart for rankings: the dot marks the value and the thin line leads the eye to the label. Comparing **entire homes only** removes the effect of room type, so the neighbourhoods are compared fairly.
+
+```{r p4, fig.cap="Figure 4: Median price of entire homes by neighbourhood", fig.height=5}
+neigh_entire <- df %>%
+  filter(room_type == "Entire home/apt") %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(median_price = median(price), n = n(), .groups = "drop") %>%
+  filter(n >= 30) %>%
+  slice_max(order_by = n, n = 12) %>%
+  mutate(neighbourhood_cleansed = fct_reorder(neighbourhood_cleansed, median_price))
+
+p4 <- ggplot(neigh_entire, aes(neighbourhood_cleansed, median_price)) +
+  geom_segment(aes(xend = neighbourhood_cleansed, y = 0, yend = median_price),
+               colour = "grey70", linewidth = 1) +
+  geom_point(size = 4.5, colour = "#0072B2") +
+  geom_text(aes(label = dollar(median_price)), hjust = -0.45, size = 3.4) +
+  scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(title = "Central neighbourhoods top the list for entire homes",
+       subtitle = "Median nightly price, 12 neighbourhoods with the most entire homes",
+       x = NULL, y = "Median price per night", caption = src) +
+  theme_airbnb()
+p4
+```
+
+```{r neigh_stats, include=FALSE}
+top_e <- neigh_entire %>% slice_max(median_price, n = 1)
+low_e <- neigh_entire %>% slice_min(median_price, n = 1)
+```
+
+**What it shows.** Among the neighbourhoods with the most entire homes, **`r as.character(top_e$neighbourhood_cleansed)`** is the most expensive (median **`r dollar(top_e$median_price)`**) and **`r as.character(low_e$neighbourhood_cleansed)`** is the least expensive (median **`r dollar(low_e$median_price)`**). The gap between the top and the bottom is **`r dollar(top_e$median_price - low_e$median_price)`** per night.
+
+**So what.** Location matters, but the differences between neighbourhoods are smaller than the differences between room types. A guest can save more by choosing a private room than by moving to a cheaper neighbourhood.
+
+## 4.5 Do bigger listings cost more? (scatter plot)
+
+**Question.** How does the number of guests a listing sleeps relate to its price?
+
+**Why this chart.** A scatter plot is the standard way to show how two numbers move together. Colouring by room type shows whether the relationship holds in each group, and the trend line gives the overall direction.
+
+```{r p5, fig.cap="Figure 5: Price versus number of guests, coloured by room type"}
+p5 <- ggplot(df, aes(accommodates_w, price_w, colour = room_type)) +
+  geom_jitter(alpha = 0.25, width = 0.25, size = 1) +
+  geom_smooth(aes(group = 1), method = "lm", formula = y ~ x,
+              colour = "black", linewidth = 0.9, se = FALSE) +
+  scale_y_log10(labels = dollar) +
+  scale_x_continuous(breaks = 1:10) +
+  scale_colour_manual(values = pal_room, name = NULL) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  labs(title = "Price rises steadily with the number of guests",
+       subtitle = "Each dot is a listing; the black line is the overall trend",
+       x = "Guests the listing sleeps (the largest 1% are capped)",
+       y = "Price per night (log scale)", caption = src) +
+  theme_airbnb()
+p5
+```
+
+**What it shows.** Price rises with capacity: the rank correlation between price and guests is **`r round(cor(df$price, df$accommodates, method = "spearman"), 2)`**, a moderate positive link. The blue dots (entire homes) sit above the orange dots (private rooms) at every size. The wide vertical spread at each guest count shows that capacity alone does not fix the price.
+
+**So what.** A larger listing usually costs more, but two listings of the same size can differ a lot in price. Location, quality and room type must explain the rest.
+
+## 4.6 How has the market grown over time? (line charts)
+
+**Question.** In which years did listings receive their first review, and are the newer listings priced differently?
+
+**Why this chart.** A line chart is the natural way to show change over time, because the line connects the years and makes the trend visible. The second panel adds the median price for each year of first review.
+
+```{r p6, fig.cap="Figure 6: Listings by year of first review, and their median price", fig.height=6.5}
+by_year <- df %>%
+  filter(!is.na(first_review)) %>%
+  mutate(year = year(first_review)) %>%
+  group_by(year) %>%
+  summarise(listings = n(), median_price = median(price), .groups = "drop")
+
+p6a <- ggplot(by_year, aes(year, listings)) +
+  geom_line(colour = "#0072B2", linewidth = 1.1) +
+  geom_point(colour = "#0072B2", size = 2.5) +
+  geom_vline(xintercept = 2020, linetype = "dotted", colour = "grey40") +
+  annotate("text", x = 2020.2, y = Inf, label = "2020: travel restrictions",
+           hjust = 0, vjust = 1.6, size = 3.2, colour = "grey30") +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Listings by the year of their first review",
+       subtitle = "The latest year is incomplete, so its drop is not a real decline",
+       x = NULL, y = "Listings", caption = src) +
+  theme_airbnb()
+
+p6b <- by_year %>%
+  filter(listings >= 20) %>%
+  ggplot(aes(year, median_price)) +
+  geom_line(colour = "#D55E00", linewidth = 1.1) +
+  geom_point(colour = "#D55E00", size = 2.5) +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  scale_y_continuous(labels = dollar, limits = c(0, NA)) +
+  labs(title = "Median price by year of first review",
+       subtitle = "Only years with at least 20 listings are shown",
+       x = "Year of first review", y = "Median price", caption = src) +
+  theme_airbnb()
+
+p6 <- p6a / p6b
+p6
+```
+
+```{r year_stats, include=FALSE}
+peak <- by_year %>% slice_max(listings, n = 1)
+```
+
+**What it shows.** The most listings received their first review in **`r peak$year`** (**`r comma(peak$listings)`** listings). The first review is only a rough marker of when a listing joined the platform, because a listing might open long before its first guest writes a review, and listings that have since left the platform are not in the data. Look at the line around 2020, the year travel was restricted: a dip there would be consistent with the pandemic. The lower panel compares the median price across the years.
+
+**So what.** The number of new listings changes from year to year, so the market did not grow evenly. When comparing the prices of older and newer listings, keep in mind that the years differ in size, and that the data is a snapshot.
+
+## 4.7 Where do size and neighbourhood combine to raise prices? (heatmap)
+
+**Question.** How does the median price change when both neighbourhood and listing size are considered together?
+
+**Why this chart.** A heatmap shows two categories at once. Colour carries the price, so a reader can spot the expensive and the cheap combinations immediately. Cells with fewer than 10 listings are left grey, because their medians would be unreliable.
+
+```{r p7, fig.cap="Figure 7: Median price by neighbourhood and listing size", fig.height=5}
+heat <- df %>%
+  filter(neighbourhood_cleansed %in% top10) %>%
+  group_by(neighbourhood_cleansed, size_group) %>%
+  summarise(median_price = median(price), n = n(), .groups = "drop") %>%
+  mutate(median_price = ifelse(n < 10, NA, median_price),
+         neighbourhood_cleansed = fct_reorder(neighbourhood_cleansed, median_price,
+                                              .fun = median, na.rm = TRUE))
+thr <- median(heat$median_price, na.rm = TRUE)
+
+p7 <- ggplot(heat, aes(size_group, neighbourhood_cleansed, fill = median_price)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = ifelse(is.na(median_price), "", dollar(median_price)),
+                colour = median_price > thr), size = 3.4, show.legend = FALSE) +
+  scale_colour_manual(values = c("TRUE" = "black", "FALSE" = "white")) +
+  scale_fill_viridis_c(option = "C", labels = dollar, na.value = "grey90",
+                       name = "Median price") +
+  labs(title = "Price depends on both size and place",
+       subtitle = "Median nightly price; grey cells have fewer than 10 listings",
+       x = NULL, y = NULL, caption = src) +
+  theme_airbnb() +
+  theme(legend.key.width = unit(1.4, "cm"), panel.grid = element_blank())
+p7
+```
+
+```{r heat_stats, include=FALSE}
+top_cell <- heat %>% slice_max(median_price, n = 1)
+low_cell <- heat %>% slice_min(median_price, n = 1)
+```
+
+**What it shows.** Reading across any row, prices rise from small to large listings. Reading down a column, prices differ by neighbourhood. The most expensive combination is **`r top_cell$size_group`** in **`r as.character(top_cell$neighbourhood_cleansed)`** (median **`r dollar(top_cell$median_price)`**), and the cheapest is **`r low_cell$size_group`** in **`r as.character(low_cell$neighbourhood_cleansed)`** (median **`r dollar(low_cell$median_price)`**).
+
+**So what.** Size and location add together. A host who wants to set a fair price should compare their listing with others of the same size in the same neighbourhood, not with the citywide average.
+
+## 4.8 Why do some neighbourhoods look cheap? (100% stacked bar chart)
+
+**Question.** Is the mix of room types the same in every neighbourhood?
+
+**Why this chart.** A 100% stacked bar shows the share of each room type in every neighbourhood, whatever the neighbourhood's size. It explains a result from Week 1: some central areas look cheap overall, even though their entire homes are the most expensive.
+
+```{r p8, fig.cap="Figure 8: Room type mix by neighbourhood", fig.height=5}
+mix <- df %>%
+  filter(neighbourhood_cleansed %in% top10) %>%
+  count(neighbourhood_cleansed, room_type) %>%
+  group_by(neighbourhood_cleansed) %>%
+  mutate(share = n / sum(n)) %>%
+  ungroup()
+
+priv <- mix %>% filter(room_type == "Private room") %>%
+  select(neighbourhood_cleansed, priv_share = share)
+
+mix <- mix %>%
+  left_join(priv, by = "neighbourhood_cleansed") %>%
+  mutate(priv_share = replace_na(priv_share, 0),
+         neighbourhood_cleansed = fct_reorder(neighbourhood_cleansed, priv_share))
+
+p8 <- ggplot(mix, aes(neighbourhood_cleansed, share, fill = room_type)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = ifelse(share >= 0.08, percent(share, accuracy = 1), "")),
+            position = position_stack(vjust = 0.5), colour = "white", size = 3.2) +
+  scale_fill_manual(values = pal_room, name = NULL) +
+  scale_y_continuous(labels = percent, expand = c(0, 0)) +
+  coord_flip() +
+  labs(title = "The central neighbourhoods have the most private rooms",
+       subtitle = "Share of listings by room type, ten largest neighbourhoods",
+       x = NULL, y = "Share of listings", caption = src) +
+  theme_airbnb()
+p8
+```
+
+```{r mix_stats, include=FALSE}
+most_priv <- mix %>% filter(room_type == "Private room") %>% slice_max(share, n = 1)
+least_priv <- mix %>% filter(room_type == "Private room") %>% slice_min(share, n = 1)
+```
+
+**What it shows.** In **`r as.character(most_priv$neighbourhood_cleansed)`**, **`r percent(most_priv$share, accuracy = 1)`** of listings are private rooms, whereas in **`r as.character(least_priv$neighbourhood_cleansed)`** it is only **`r percent(least_priv$share, accuracy = 1)`**. Neighbourhoods with a high private-room share have a lower overall median price, simply because private rooms are cheaper.
+
+**So what.** This is a classic trap. A neighbourhood can look cheap in an overall average while being expensive for like-for-like listings. Comparing entire homes only (Figure 4) removes the trap.
+
+## 4.9 Where are the expensive listings? (map)
+
+**Question.** Is there a geographic pattern in prices?
+
+**Why this chart.** Latitude and longitude can be plotted directly as a map-like scatter plot. Colour shows the price, and the most expensive listings are drawn last so they are not hidden under cheaper ones.
+
+```{r p9, fig.cap="Figure 9: Map of listings coloured by price", fig.height=5}
+p9 <- df %>%
+  arrange(price_w) %>%
+  ggplot(aes(longitude, latitude, colour = log_price)) +
+  geom_point(size = 0.9, alpha = 0.7) +
+  scale_colour_viridis_c(option = "C", name = "Price per night",
+                         breaks = log(c(75, 150, 300, 600, 1000)),
+                         labels = dollar(c(75, 150, 300, 600, 1000))) +
+  coord_quickmap() +
+  labs(title = "Listings cluster in the centre, where prices tend to be higher",
+       subtitle = "Each dot is a listing; brighter colours are more expensive",
+       x = "Longitude", y = "Latitude", caption = src) +
+  theme_airbnb() +
+  theme(legend.key.width = unit(1.4, "cm"))
+p9
+```
+
+**What it shows.** The densest cluster of listings is in the central and western parts of the city, and the brighter, more expensive points gather in that dense core. The outer areas show mostly darker, lower-priced points. Because many dots overlap in the centre, the map shows the general pattern, not exact prices.
+
+**So what.** Distance from the centre matters for price. The map also shows how concentrated the market is, with most listings in a small part of the city.
+
+## 4.10 What is most related to price? (correlation chart)
+
+**Question.** Which listing features move most closely with price?
+
+**Why this chart.** A correlation chart compares many numeric variables on one scale, from -1 (move in opposite directions) to +1 (move together). Sorting the bars shows the strongest relationships first.
+
+```{r p10, fig.cap="Figure 10: Correlation of each variable with log price", fig.height=4.5}
+cor_data <- df %>%
+  transmute(log_price,
+            `Bedrooms` = bedrooms_w, `Guests` = accommodates_w, `Beds` = beds_w,
+            `Review score` = review_scores_rating_w,
+            `Superhost` = host_is_superhost,
+            `Days available` = availability_365,
+            `Minimum nights` = minimum_nights_w,
+            `Number of reviews` = number_of_reviews_w)
+
+cors <- cor(cor_data)[, "log_price"] %>%
+  enframe(name = "variable", value = "r") %>%
+  filter(variable != "log_price") %>%
+  mutate(variable = fct_reorder(variable, r),
+         direction = ifelse(r >= 0, "Higher price", "Lower price"))
+
+p10 <- ggplot(cors, aes(variable, r, fill = direction)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f", r), hjust = ifelse(r >= 0, -0.2, 1.2)), size = 3.5) +
+  scale_fill_manual(values = c("Higher price" = "#0072B2", "Lower price" = "#D55E00"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(-0.6, 0.7)) +
+  coord_flip() +
+  labs(title = "Size matters most; popular listings tend to be cheaper",
+       subtitle = "Correlation with log price (positive = goes with higher prices)",
+       x = NULL, y = "Correlation", caption = src) +
+  theme_airbnb()
+p10
+```
+
+```{r cor_stats, include=FALSE}
+top_cor <- cors %>% slice_max(abs(r), n = 1)
+nrev <- cors %>% filter(variable == "Number of reviews")
+```
+
+**What it shows.** The strongest relationship is with **`r tolower(as.character(top_cor$variable))`** (correlation **`r round(top_cor$r, 2)`**), followed by the other size variables. Number of reviews has a correlation of **`r round(nrev$r, 2)`**: listings with many reviews tend to be cheaper. Minimum nights and days available hardly relate to price at all.
+
+**So what.** Correlation is not causation. Many reviews do not make a listing cheaper; they probably go with long-running, lower-priced rooms that get booked often. The chart tells us where to look, not why.
+
+## 4.11 Do Superhosts charge less? (dumbbell chart)
+
+**Question.** Superhosts looked cheaper overall in Week 1. Is that still true when listings of the same type are compared?
+
+**Why this chart.** A dumbbell chart puts two values on the same line, joined by a segment, so the size of the gap is easy to see for each room type.
+
+```{r p11, fig.cap="Figure 11: Median price of Superhost and other hosts by room type", fig.height=3.5}
+sh <- df %>%
+  filter(room_type %in% c("Entire home/apt", "Private room")) %>%
+  group_by(room_type, host_is_superhost) %>%
+  summarise(median_price = median(price), n = n(), .groups = "drop") %>%
+  mutate(host = ifelse(host_is_superhost == 1, "Superhost", "Other hosts"))
+
+sh_wide <- sh %>%
+  select(room_type, host, median_price) %>%
+  pivot_wider(names_from = host, values_from = median_price)
+
+p11 <- ggplot() +
+  geom_segment(data = sh_wide,
+               aes(x = `Other hosts`, xend = Superhost, y = room_type, yend = room_type),
+               colour = "grey65", linewidth = 2) +
+  geom_point(data = sh, aes(median_price, room_type, colour = host), size = 5) +
+  geom_text(data = filter(sh, host == "Superhost"),
+            aes(median_price, room_type, label = dollar(median_price)),
+            vjust = -1.6, size = 3.4) +
+  geom_text(data = filter(sh, host == "Other hosts"),
+            aes(median_price, room_type, label = dollar(median_price)),
+            vjust = 2.4, size = 3.4) +
+  scale_colour_manual(values = c("Superhost" = "#D55E00", "Other hosts" = "#0072B2"),
+                      name = NULL) +
+  scale_x_continuous(labels = dollar, expand = expansion(mult = c(0.1, 0.1))) +
+  labs(title = "Superhost price gaps shrink once the room type is the same",
+       subtitle = "Median price per night within each room type",
+       x = "Median price per night", y = NULL, caption = src) +
+  theme_airbnb()
+p11
+```
+
+```{r sh_stats, include=FALSE}
+ent <- sh_wide %>% filter(room_type == "Entire home/apt")
+prv <- sh_wide %>% filter(room_type == "Private room")
+ent_sup <- ent[["Superhost"]];    ent_oth <- ent[["Other hosts"]]
+prv_sup <- prv[["Superhost"]];    prv_oth <- prv[["Other hosts"]]
+```
+
+**What it shows.** For entire homes, the median Superhost price is **`r dollar(ent_sup)`** against **`r dollar(ent_oth)`** for other hosts. For private rooms it is **`r dollar(prv_sup)`** against **`r dollar(prv_oth)`**. The gaps are smaller than the overall gap suggested at first (which compared all listings together), because Superhosts own proportionally more private rooms, which are cheaper.
+
+**So what.** The "Superhost discount" is mostly a difference in what Superhosts rent out, not in how they price. Splitting the data by room type changes the conclusion, so always check the mix before comparing groups.
+
+## 4.12 The same story in other R graphics systems (base R and lattice)
+
+**Why include this.** R has several plotting systems. `ggplot2` is used above, but base R and `lattice` are also widely used, so one example of each is shown.
+
+**Base R: counts of listings by room type.**
+
+```{r base, fig.cap="Figure 12: Listings by room type (base R graphics)", fig.height=3.5}
+tab <- sort(table(df$room_type))
+par(mar = c(4, 9, 3, 2))
+barplot(tab, horiz = TRUE, las = 1, col = pal_room[names(tab)], border = NA,
+        main = "Listings by room type (base R)", xlab = "Number of listings")
+```
+
+**Lattice: price distribution of entire homes and private rooms.**
+
+```{r lattice, fig.cap="Figure 13: Price distribution by room type (lattice graphics)", fig.height=4}
+two <- df %>% filter(room_type %in% c("Entire home/apt", "Private room")) %>% droplevels()
+print(densityplot(~ log_price, groups = room_type, data = two,
+                  plot.points = FALSE, lwd = 2,
+                  col = pal_room[levels(two$room_type)],
+                  auto.key = list(columns = 2, lines = TRUE, points = FALSE),
+                  xlab = "Log of price per night",
+                  main = "Price distribution by room type (lattice)"))
+```
+
+**What they show.** The base R bar chart repeats the message of Figure 2: entire homes dominate. The lattice density curves show the full price distribution of the two main room types, where the entire-home curve sits to the right of the private-room curve. The curves overlap, which agrees with the wide spread seen in Figure 3.
+
+# 5. Dashboard: Four Key Charts Together
+
+Four of the charts can be put in one panel to give a quick overview. This is useful for a presentation or a one-page summary.
+
+```{r dashboard, fig.cap="Figure 14: Summary dashboard", fig.width=11, fig.height=8.5}
+(p1 + p2) / (p3 + p5) +
+  plot_annotation(title = "Amsterdam Airbnb at a glance",
+                  theme = theme(plot.title = element_text(face = "bold", size = 16)))
+```
+
+# 6. Key Insights
+
+1. **The typical price is lower than the average.** The median is `r dollar(median(df$price))` and the mean is `r dollar(mean(df$price))`, because a few very expensive listings pull the average up (Figure 1).
+2. **Room type is the clearest price signal.** Entire homes have a median of `r dollar(mp["Entire home/apt"])` against `r dollar(mp["Private room"])` for private rooms (Figures 2 and 3).
+3. **Size and place add together.** Prices rise with guest capacity, and the most expensive combinations are large listings in central neighbourhoods (Figures 5 and 7).
+4. **Averages can hide the real pattern.** Central neighbourhoods look cheap overall because they have many private rooms, but they are the most expensive for entire homes (Figures 4 and 8).
+5. **The Superhost discount is mostly a mix effect.** Within the same room type the gaps are small (Figure 11).
+6. **The market is concentrated.** Most listings sit in the central and western parts of the city (Figure 9).
+
+# 7. Reflection and Limitations
+
+- **Snapshot data.** The dataset is a single snapshot, so the time chart describes first-review dates, not the true opening dates of listings.
+- **Asking prices.** Prices are what hosts ask, not what guests paid.
+- **Missing prices.** About two out of five listings had no price in the file and were removed, so the charts describe the listings that publish a price.
+- **Correlation is not causation.** The charts show patterns, not reasons.
+- **Small groups.** Hotel and shared rooms have very few listings, so their results are only indicative.
+
+# Appendix: Exporting the Charts and Reproducibility
+
+The charts are also saved as separate 300 dpi image files in a `figures` folder for use in presentations.
+
+```{r export, eval=TRUE}
+dir.create("figures", showWarnings = FALSE)
+figs <- list(`01_price_histogram` = p1, `02_room_type_bar` = p2, `03_price_by_room_boxplot` = p3,
+             `04_neighbourhood_lollipop` = p4, `05_price_vs_guests_scatter` = p5,
+             `06_listings_over_time_line` = p6, `07_price_heatmap` = p7,
+             `08_room_mix_stacked_bar` = p8, `09_price_map` = p9,
+             `10_correlation_chart` = p10, `11_superhost_dumbbell` = p11)
+for (nm in names(figs)) {
+  try(ggsave(file.path("figures", paste0(nm, ".png")), figs[[nm]],
+             width = 7, height = 5, dpi = 300), silent = TRUE)
+}
+list.files("figures")
+```
+
+```{r session}
+sessionInfo()
+```
